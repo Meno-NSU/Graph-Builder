@@ -1,0 +1,9 @@
+nest-asyncio
+spacy
+pymorphy3
+tqdm
+nltk
+torch
+transformers
+openai
+git+https://github.com/HKUDS/LightRAG.git
