@@ -346,124 +346,124 @@ async def initialize_rag():
 
     return rag
 
+if __name__ == '__main__':
+    setup_logger("lightrag", level="INFO")
+    random.seed(RANDOM_SEED)
 
-setup_logger("lightrag", level="INFO")
-random.seed(RANDOM_SEED)
+    dataset_dir = 'pages_txt'
+    print(f'os.path.isdir({dataset_dir}) = {os.path.isdir(dataset_dir)}')
 
-dataset_dir = 'pages_txt'
-print(f'os.path.isdir({dataset_dir}) = {os.path.isdir(dataset_dir)}')
+    text_files = list(
+        map(lambda it2: os.path.join(dataset_dir, it2), filter(lambda it1: it1.endswith('.txt'), os.listdir(dataset_dir))))
 
-text_files = list(
-    map(lambda it2: os.path.join(dataset_dir, it2), filter(lambda it1: it1.endswith('.txt'), os.listdir(dataset_dir))))
+    # python -m spacy download ru_core_news_sm
+    config_fname = os.path.join('full_abbreviations_updated.json')
+    config, spacy, pymorphy = initialize_abbreviation_subsystem(config_fname)
 
-# python -m spacy download ru_core_news_sm
-config_fname = os.path.join('full_abbreviations_updated.json')
-config, spacy, pymorphy = initialize_abbreviation_subsystem(config_fname)
-
-text_data = []
-for cur_fname in text_files:
-    with codecs.open(cur_fname, mode='r', encoding='utf-8', errors='ignore') as fp:
-        new_text = '\n'.join(list(map(
-            lambda it3: ' '.join(it3.replace('\r', ' ').split()),
-            filter(
-                lambda it2: len(it2) > 0,
-                map(
-                    lambda it1: it1.strip(),
-                    fp.readlines()
+    text_data = []
+    for cur_fname in text_files:
+        with codecs.open(cur_fname, mode='r', encoding='utf-8', errors='ignore') as fp:
+            new_text = '\n'.join(list(map(
+                lambda it3: ' '.join(it3.replace('\r', ' ').split()),
+                filter(
+                    lambda it2: len(it2) > 0,
+                    map(
+                        lambda it1: it1.strip(),
+                        fp.readlines()
+                    )
                 )
-            )
-        ))).strip()
-    if len(new_text) > 0:
-        text_data.append(convert(new_text))
-    del new_text
+            ))).strip()
+        if len(new_text) > 0:
+            text_data.append(convert(new_text))
+        del new_text
 
-print(f'Number of documents is {len(text_data)}.')
-print(f'3 random documents:')
-for it in random.sample(text_data, 3):
-    print('\n' + it)
+    print(f'Number of documents is {len(text_data)}.')
+    print(f'3 random documents:')
+    for it in random.sample(text_data, 3):
+        print('\n' + it)
 
-special_tokens = dict()
-re_for_special_tokens = re.compile(r'\[\w+?\]')
-for cur_text in tqdm(text_data):
-    start_pos = 0
-    search_res = re_for_special_tokens.search(cur_text[start_pos:])
-    while search_res is not None:
-        token_start = start_pos + search_res.start()
-        token_end = start_pos + search_res.end()
-        new_special_token = cur_text[token_start:token_end]
-        special_tokens[new_special_token] = special_tokens.get(new_special_token, 0) + 1
-        start_pos = token_end
+    special_tokens = dict()
+    re_for_special_tokens = re.compile(r'\[\w+?\]')
+    for cur_text in tqdm(text_data):
+        start_pos = 0
         search_res = re_for_special_tokens.search(cur_text[start_pos:])
-special_token_keys = sorted(list(special_tokens.keys()), key=lambda it: (-special_tokens[it], it))
-print(f'There are {len(special_tokens)} special tokens. They are:')
-for it in special_token_keys:
-    print('{0:>20}: {1:>6}'.format(it, special_tokens[it]))
+        while search_res is not None:
+            token_start = start_pos + search_res.start()
+            token_end = start_pos + search_res.end()
+            new_special_token = cur_text[token_start:token_end]
+            special_tokens[new_special_token] = special_tokens.get(new_special_token, 0) + 1
+            start_pos = token_end
+            search_res = re_for_special_tokens.search(cur_text[start_pos:])
+    special_token_keys = sorted(list(special_tokens.keys()), key=lambda it: (-special_tokens[it], it))
+    print(f'There are {len(special_tokens)} special tokens. They are:')
+    for it in special_token_keys:
+        print('{0:>20}: {1:>6}'.format(it, special_tokens[it]))
 
-WORKING_DIR = 'prepared_it_new'
-if not os.path.exists(WORKING_DIR):
-    os.mkdir(WORKING_DIR)
-VLLM_API_KEY = ''
-VLLM_BASE_URL = 'everest.nsu.ru:9111'
-os.environ['OPENAI_API_KEY'] = VLLM_API_KEY
-LLM_NAME = 'RuadaptQwen3-32B-Instruct'
-TEMPERATURE = 0.3
-QUERY_MAX_TOKENS = 8000
-LOCAL_EMBEDDER_DIMENSION = 768
-LOCAL_EMBEDDER_MAX_TOKENS = 4096
-LOCAL_EMBEDDER_NAME = '/workspace/data/models/gte-multilingual-base'
-print(f'os.path.isdir({LOCAL_EMBEDDER_NAME}) = {os.path.isdir(LOCAL_EMBEDDER_NAME)}')
-ABBREVIATIONS_FNAME = 'full_abbreviations_updated.json'
-print(f'os.path.isfile({ABBREVIATIONS_FNAME}) = {os.path.isfile(ABBREVIATIONS_FNAME)}')
-TEMPLATE_FOR_ABBREVIATION_EXPLAINING = '''Отредактируйте, пожалуйста, текст заданного документа так, чтобы этот документ стал более простым и понятным для обычных людей от юных старшеклассников до пожилых мужчин и женщин. При этом не надо, пожалуйста, применять markdown или иной вид гипертекста. Главное, на что вам надо обратить внимание и по возможности исправить - это логика изложения и понятность формулировок документа. Ничего не объясняйте и не комментируйте своё решение, просто перепишите текст документа.
+    WORKING_DIR = 'prepared_it_new'
+    if not os.path.exists(WORKING_DIR):
+        os.mkdir(WORKING_DIR)
+    VLLM_API_KEY = ''
+    VLLM_BASE_URL = 'everest.nsu.ru:9111'
+    os.environ['OPENAI_API_KEY'] = VLLM_API_KEY
+    LLM_NAME = 'RuadaptQwen3-32B-Instruct'
+    TEMPERATURE = 0.3
+    QUERY_MAX_TOKENS = 8000
+    LOCAL_EMBEDDER_DIMENSION = 768
+    LOCAL_EMBEDDER_MAX_TOKENS = 4096
+    LOCAL_EMBEDDER_NAME = '/workspace/data/models/gte-multilingual-base'
+    print(f'os.path.isdir({LOCAL_EMBEDDER_NAME}) = {os.path.isdir(LOCAL_EMBEDDER_NAME)}')
+    ABBREVIATIONS_FNAME = 'full_abbreviations_updated.json'
+    print(f'os.path.isfile({ABBREVIATIONS_FNAME}) = {os.path.isfile(ABBREVIATIONS_FNAME)}')
+    TEMPLATE_FOR_ABBREVIATION_EXPLAINING = '''Отредактируйте, пожалуйста, текст заданного документа так, чтобы этот документ стал более простым и понятным для обычных людей от юных старшеклассников до пожилых мужчин и женщин. При этом не надо, пожалуйста, применять markdown или иной вид гипертекста. Главное, на что вам надо обратить внимание и по возможности исправить - это логика изложения и понятность формулировок документа. Ничего не объясняйте и не комментируйте своё решение, просто перепишите текст документа.
+    
+    Обратите внимание, что документ анонимизирован, то есть все именованные сущности заменены специальными словами-масками в квадратных скобках (например, вместо текста "Иван Иванович Иванов любит горчицу" вы встретите текст "[NAME] любит горчицу"). Полный список специальных слов-масок приведён здесь: {special_masks}. Не изменяйте этих слов, пожалуйста, а оставляйте как есть.
+    
+    Также исправьте грамматические ошибки в тексте документа, если они там есть. Кроме того, если вы обнаружите аббревиатуры в тексте этого документа, то замените все обнаруженные аббревиатуры их корректными расшифровками, сохранив морфологическую и синтаксическую согласованность. Вот здесь вы можете ознакомиться с JSON-словарём, описывающим возможные аббревиатуры и их расшифровки:
+    
+    ```json
+    {abbreviations_dict}
+    ```
+    
+    Далее приведён текст документа, нуждающийся в возможном улучшении:
+    
+    ```text
+    {text_of_document}
+    ```'''
 
-Обратите внимание, что документ анонимизирован, то есть все именованные сущности заменены специальными словами-масками в квадратных скобках (например, вместо текста "Иван Иванович Иванов любит горчицу" вы встретите текст "[NAME] любит горчицу"). Полный список специальных слов-масок приведён здесь: {special_masks}. Не изменяйте этих слов, пожалуйста, а оставляйте как есть.
+    client = OpenAI(
+        api_key=VLLM_API_KEY,
+        base_url=VLLM_BASE_URL,
+    )
 
-Также исправьте грамматические ошибки в тексте документа, если они там есть. Кроме того, если вы обнаружите аббревиатуры в тексте этого документа, то замените все обнаруженные аббревиатуры их корректными расшифровками, сохранив морфологическую и синтаксическую согласованность. Вот здесь вы можете ознакомиться с JSON-словарём, описывающим возможные аббревиатуры и их расшифровки:
+    MAX_NUMBER_OF_TEXTS = None
 
-```json
-{abbreviations_dict}
-```
+    improved_texts_fname = os.path.join(WORKING_DIR, 'improved_texts.json')
 
-Далее приведён текст документа, нуждающийся в возможном улучшении:
+    if os.path.isfile(improved_texts_fname):
+        with open(improved_texts_fname, mode='r', encoding='utf-8') as fp:
+            improved_texts = json.load(fp)
 
-```text
-{text_of_document}
-```'''
+    with codecs.open(improved_texts_fname, mode='w', encoding='utf-8') as fp:
+        json.dump(fp=fp, obj=improved_texts, ensure_ascii=False, indent=4)
 
-client = OpenAI(
-    api_key=VLLM_API_KEY,
-    base_url=VLLM_BASE_URL,
-)
+    print(f'3 random examples of improved texts:')
+    if MAX_NUMBER_OF_TEXTS is None:
+        selected_indices = random.sample(list(range(len(text_data))), 3)
+    else:
+        selected_indices = random.sample(list(range(len(text_data[0:MAX_NUMBER_OF_TEXTS]))), 3)
+    for example_index in selected_indices:
+        print('')
+        print('BEFORE IMPROVING:')
+        print(' '.join(text_data[example_index].split()))
+        print('AFTER IMPROVING:')
+        print(' '.join(improved_texts[example_index].split()))
 
-MAX_NUMBER_OF_TEXTS = None
-
-improved_texts_fname = os.path.join(WORKING_DIR, 'improved_texts.json')
-
-if os.path.isfile(improved_texts_fname):
-    with open(improved_texts_fname, mode='r', encoding='utf-8') as fp:
-        improved_texts = json.load(fp)
-
-with codecs.open(improved_texts_fname, mode='w', encoding='utf-8') as fp:
-    json.dump(fp=fp, obj=improved_texts, ensure_ascii=False, indent=4)
-
-print(f'3 random examples of improved texts:')
-if MAX_NUMBER_OF_TEXTS is None:
-    selected_indices = random.sample(list(range(len(text_data))), 3)
-else:
-    selected_indices = random.sample(list(range(len(text_data[0:MAX_NUMBER_OF_TEXTS]))), 3)
-for example_index in selected_indices:
-    print('')
-    print('BEFORE IMPROVING:')
-    print(' '.join(text_data[example_index].split()))
-    print('AFTER IMPROVING:')
-    print(' '.join(improved_texts[example_index].split()))
-
-nest_asyncio.apply()
-rag = asyncio.run(initialize_rag())
-if MAX_NUMBER_OF_TEXTS is None:
-    for cur_text in tqdm(improved_texts):
-        rag.insert(cur_text)
-else:
-    for cur_text in tqdm(improved_texts[0:MAX_NUMBER_OF_TEXTS]):
-        rag.insert(cur_text)
-rag.finalize_storages()
+    nest_asyncio.apply()
+    rag = asyncio.run(initialize_rag())
+    if MAX_NUMBER_OF_TEXTS is None:
+        for cur_text in tqdm(improved_texts):
+            rag.insert(cur_text)
+    else:
+        for cur_text in tqdm(improved_texts[0:MAX_NUMBER_OF_TEXTS]):
+            rag.insert(cur_text)
+    rag.finalize_storages()
