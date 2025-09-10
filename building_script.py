@@ -445,7 +445,7 @@ if __name__ == '__main__':
     VLLM_API_KEY = ''
     VLLM_BASE_URL = "http://127.0.0.1:9111/v1"
     os.environ['OPENAI_API_KEY'] = VLLM_API_KEY
-    LLM_NAME = 'RuadaptQwen3-32B-Instruct'
+    LLM_NAME = 'meno-medium-0.1'
     TEMPERATURE = 0.3
     QUERY_MAX_TOKENS = 8000
     LOCAL_EMBEDDER_DIMENSION = 768
