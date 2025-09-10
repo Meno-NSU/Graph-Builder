@@ -443,7 +443,7 @@ if __name__ == '__main__':
     if not os.path.exists(WORKING_DIR):
         os.mkdir(WORKING_DIR)
     VLLM_API_KEY = ''
-    VLLM_BASE_URL = 'everest.nsu.ru:9111'
+    VLLM_BASE_URL = "http://127.0.0.1:9111/v1"
     os.environ['OPENAI_API_KEY'] = VLLM_API_KEY
     LLM_NAME = 'RuadaptQwen3-32B-Instruct'
     TEMPERATURE = 0.3
