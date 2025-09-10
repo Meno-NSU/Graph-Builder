@@ -5,125 +5,8 @@ import json
 import os
 import random
 import re
-import time
 import warnings
-from contextlib import contextmanager
-from functools import wraps
-from typing import Dict, List, Tuple, Any, Optional
-
-import logging
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.DEBUG),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s",
-)
-logger = logging.getLogger("abbr_rag_pipeline")
-
-
-def secs(dt: float) -> str:
-    return f"{dt:.3f}s"
-
-
-def shorten(obj: Any, limit: int = 200) -> str:
-    s = str(obj)
-    return s if len(s) <= limit else s[:limit] + f"...(+{len(s) - limit} chars)"
-
-
-def safe_len(x) -> Optional[int]:
-    try:
-        return len(x)
-    except Exception:
-        return None
-
-
-def log_exception(e: Exception) -> None:
-    logger.exception("Exception: %s", e)
-
-
-def log_kv(**kw):
-    return " ".join(f"{k}={kw[k]}" for k in kw)
-
-
-def debug_mem(prefix: str = ""):
-    try:
-        import psutil, os
-        p = psutil.Process(os.getpid())
-        rss = p.memory_info().rss / (1024 ** 2)
-        logger.debug("%sRSS=%.1f MB", f"{prefix} " if prefix else "", rss)
-    except Exception:
-        pass
-
-
-def time_now() -> float:
-    return time.perf_counter()
-
-
-def elapsed(t0: float) -> str:
-    return secs(time_now() - t0)
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def log_iter_preview(name: str, it, n: int = 3):
-    try:
-        lst = list(it)
-        logger.debug("%s: total=%d sample=%s", name, len(lst), shorten(lst[:n]))
-        return lst
-    except Exception as e:
-        logger.warning("Failed preview for %s: %s", name, e)
-        return it
-
-
-def device_info():
-    try:
-        import torch
-        cuda = torch.cuda.is_available()
-        device_count = torch.cuda.device_count()
-        dev_name = torch.cuda.get_device_name(0) if cuda and device_count > 0 else "CPU"
-        logger.info("Torch device: cuda=%s device_count=%d name=%s", cuda, device_count, dev_name)
-    except Exception as e:
-        logger.warning("Torch not available or failed to query device: %s", e)
-
-
-def log_io(level=logging.DEBUG):
-    def deco(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            t0 = time_now()
-            try:
-                logger.log(level, "→ %s(args=%s, kwargs=%s)", fn.__name__, shorten(args), shorten(kwargs))
-                res = fn(*args, **kwargs)
-                logger.log(level, "← %s done in %s; result_preview=%s",
-                           fn.__name__, elapsed(t0), shorten(res, 300))
-                return res
-            except Exception as e:
-                logger.error("✖ %s failed in %s: %s", fn.__name__, elapsed(t0), e)
-                log_exception(e)
-                raise
-
-        return wrapper
-
-    return deco
-
-
-@contextmanager
-def log_section(title: str, level=logging.INFO):
-    t0 = time_now()
-    logger.log(level, "▶ %s ...", title)
-    try:
-        yield
-        logger.log(level, "■ %s done in %s", title, elapsed(t0))
-    except Exception as e:
-        logger.error("■ %s failed in %s: %s", title, elapsed(t0), e)
-        log_exception(e)
-        raise
-
+from typing import Dict, List, Tuple
 
 import nest_asyncio
 import nltk
@@ -139,8 +22,40 @@ from nltk.stem.snowball import SnowballStemmer
 from openai import OpenAI
 from pymorphy3 import MorphAnalyzer
 from pymorphy3.analyzer import Parse
-from tqdm import tqdm
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 from transformers import AutoTokenizer, AutoModel
+import logging
+import time
+from contextlib import contextmanager
+from typing import Any, Optional
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.DEBUG),
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s",
+)
+logger = logging.getLogger("kg_pipeline")
+
+def secs(dt: float) -> str:
+    return f"{dt:.3f}s"
+
+def shorten(obj: Any, limit: int = 500) -> str:
+    s = str(obj)
+    return s if len(s) <= limit else s[:limit] + f"...(+{len(s) - limit} chars)"
+
+@contextmanager
+def log_step(title: str, level: int = logging.INFO):
+    t0 = time.time()
+    logger.log(level, f"▶ {title} — start")
+    try:
+        yield
+    except Exception as e:
+        logger.exception(f"✖ {title} — failed: {e}")
+        raise
+    finally:
+        logger.log(level, f"✔ {title} — done in {secs(time.time() - t0)}")
 
 RANDOM_SEED = 42
 
@@ -178,174 +93,180 @@ NUMBER_DICT: Dict[str, str] = {
 }
 
 
-@log_io()
-def initialize_abbreviation_subsystem(config_name: str) -> Tuple[
-    Dict[str, Tuple[List[str], List[Tuple[str, str, str]]]],
-    spacy.Language, MorphAnalyzer
-]:
-    with log_section(f"Load spaCy model 'ru_core_news_sm'"):
-        nlp = spacy.load('ru_core_news_sm')
-    with log_section("Init pymorphy3 MorphAnalyzer"):
-        analyzer = MorphAnalyzer()
-    with log_section(f"Read abbreviation config: {config_name}"):
-        with codecs.open(config_name, mode='r', encoding='utf-8', errors='ignore') as fp:
-            data = json.load(fp)
+def initialize_abbreviation_subsystem(config_name: str) -> (
+        Tuple)[Dict[str, Tuple[List[str], List[Tuple[str, str, str]]]], spacy.Language, MorphAnalyzer]:
+    nlp = spacy.load('ru_core_news_sm')
+    analyzer = MorphAnalyzer()
+    with codecs.open(config_name, mode='r', encoding='utf-8', errors='ignore') as fp:
+        data = json.load(fp)
     if not isinstance(data, dict):
-        raise ValueError(f'Abbreviation config "{config_name}" must be a dict')
-    logger.info("Abbreviation entries: %d", len(data))
+        err_msg = f'The abbreviation config "{config_name}" contains a wrong information!'
+        raise ValueError(err_msg)
+    keys = list(data.keys())
     abbr = dict()
-    for k, v in data.items():
-        if not isinstance(k, str) or not k.isalpha() or not isinstance(v, str) or not v.strip():
-            raise ValueError(f'Config "{config_name}" contains invalid key/value: {k} -> {v}')
-        v = v.strip()
+    for k in keys:
+        if not isinstance(k, str):
+            err_msg = f'The abbreviation config "{config_name}" contains a wrong information!'
+            raise ValueError(err_msg)
+        if not k.isalpha():
+            err_msg = f'The abbreviation config "{config_name}" contains a wrong information!'
+            raise ValueError(err_msg)
+        if not isinstance(data[k], str):
+            err_msg = f'The abbreviation config "{config_name}" contains a wrong information!'
+            raise ValueError(err_msg)
+        v = data[k].strip()
+        if len(v) == 0:
+            err_msg = f'The abbreviation config "{config_name}" contains a wrong information!'
+            raise ValueError(err_msg)
         doc = nlp(v)
-        tokens, morpho_data = [], []
+        tokens = []
+        morpho_data = []
         for token in doc:
             tokens.append(token.text)
-            pos = POS_DICT.get(str(token.pos_), str(token.pos_))
-            case_list = token.morph.get('Case')
-            case = CASE_DICT.get(case_list[0], '') if case_list and case_list[0] else ''
-            number_list = token.morph.get('Number')
-            number = NUMBER_DICT.get(number_list[0], '') if number_list and number_list[0] else ''
+            if str(token.pos_) in POS_DICT:
+                pos = POS_DICT[str(token.pos_)]
+            else:
+                pos = str(token.pos_)
+            case = token.morph.get('Case')
+            if len(case) > 0:
+                if len(case[0]) > 0:
+                    case = CASE_DICT[str(case[0])]
+                else:
+                    case = ''
+            else:
+                case = ''
+            number = token.morph.get('Number')
+            if len(number) > 0:
+                if len(number[0]) > 0:
+                    number = NUMBER_DICT[str(number[0])]
+                else:
+                    number = ''
+            else:
+                number = ''
             morpho_data.append((pos, case, number))
         abbr[k.lower()] = (tokens, morpho_data)
-    logger.info("Built abbreviation map: %d items", len(abbr))
+        del doc, tokens, morpho_data
     return abbr, nlp, analyzer
 
 
-@log_io()
-def tokenize_and_analyze_morphology(text: str, nlp: spacy.Language) -> Tuple[
-    List[str], List[Tuple[int, int]], List[Tuple[str, str, str]]
-]:
+def tokenize_and_analyze_morphology(text: str, nlp: spacy.Language) -> (
+        Tuple)[List[str], List[Tuple[int, int]], List[Tuple[str, str, str]]]:
     doc = nlp(text)
-    all_tokens, all_bounds, all_morpho = [], [], []
+    all_tokens = []
+    all_bounds = []
+    all_morpho = []
     for token in doc:
         all_tokens.append(token.text)
         all_bounds.append((token.idx, token.idx + len(token)))
         pos = POS_DICT.get(str(token.pos_), str(token.pos_))
-        case_list = token.morph.get('Case')
-        if case_list and case_list[0]:
-            case = CASE_DICT.get(case_list[0], '')
-            if case == 'accs':
-                case = 'loct'
+        case = token.morph.get('Case')
+        if len(case) > 0:
+            if len(case[0]) > 0:
+                case = CASE_DICT[str(case[0])]
+                if case == 'accs':
+                    case = 'loct'
+            else:
+                case = ''
         else:
             case = ''
-        number_list = token.morph.get('Number')
-        number = NUMBER_DICT.get(number_list[0], '') if number_list and number_list[0] else ''
+        number = token.morph.get('Number')
+        if len(number) > 0:
+            if len(number[0]) > 0:
+                number = NUMBER_DICT[str(number[0])]
+            else:
+                number = ''
+        else:
+            number = ''
         all_morpho.append((pos, case, number))
-    logger.debug("Tokenized: tokens=%d bounds=%d morpho=%d",
-                 len(all_tokens), len(all_bounds), len(all_morpho))
+    del doc
     return all_tokens, all_bounds, all_morpho
 
 
-@log_io()
 def find_main_token(phrase_tokens: List[str], morpho: List[Tuple[str, str, str]]) -> int:
-    if len(phrase_tokens) != len(morpho):
-        raise ValueError(f'Mismatch tokens vs morpho: {len(phrase_tokens)} != {len(morpho)}')
     found_idx = -1
-    for idx, m in enumerate(morpho):
-        if (m[0] in {'NOUN', 'NPRO'}) and (m[1] == 'nomn'):
+    n = len(phrase_tokens)
+    if n != len(morpho):
+        err_msg = (f'Number of tokens does not equal to number of morphological items! '
+                   f'{phrase_tokens} != {morpho}')
+        raise ValueError(err_msg)
+    for idx in range(n):
+        if (morpho[idx][0] in {'NOUN', 'NPRO'}) and (morpho[idx][1] == 'nomn'):
             found_idx = idx
-    logger.debug("find_main_token: idx=%d phrase=%s", found_idx, shorten(phrase_tokens))
     return found_idx
 
 
-@log_io()
 def find_form(token: str, morpho: Tuple[str, str, str], analyzer: MorphAnalyzer) -> Parse:
     variants = analyzer.parse(token)
-    if not variants:
-        raise ValueError(f"No morph variants returned for token={token}")
     best = variants[0]
     for it in variants[1:]:
-        try:
-            if it.tag.POS == morpho[0] and (morpho[2] in {'sing', 'plur'} and it.tag.number == morpho[2]):
-                best = it
-        except Exception:
-            pass
+        if it.tag.POS == morpho[0] and (morpho[2] in {'sing', 'plur'} and it.tag.number == morpho[2]):
+            best = it
     return best
 
 
-@log_io()
-def inflect_phrase(
-        phrase_tokens: List[str],
-        morpho: List[Tuple[str, str, str]],
-        inflector: MorphAnalyzer,
-        target_case: str,
-        target_number: str
-) -> str:
+def inflect_phrase(phrase_tokens: List[str], morpho: List[Tuple[str, str, str]], inflector: MorphAnalyzer,
+                   target_case: str, target_number: str) -> str:
     main_token_idx = find_main_token(phrase_tokens, morpho)
     if main_token_idx < 0:
-        msg = f'The text "{" ".join(phrase_tokens)}" cannot be inflected!'
-        warnings.warn(msg)
-        logger.warning(msg)
+        warnings.warn(f'The text "{" ".join(phrase_tokens)}" cannot be inflected!')
         return ' '.join(phrase_tokens)
     inflected_tokens = []
     for idx, val in enumerate(phrase_tokens):
         if idx <= main_token_idx:
+            # Исключаем пустые значения
             target_grammemes = set()
             if target_case:
                 target_grammemes.add(target_case)
             if target_number:
                 target_grammemes.add(target_number)
-            try:
-                inflection = find_form(val, morpho[idx], inflector).inflect(target_grammemes)
-                inflected_tokens.append(inflection.word if inflection is not None else val)
-            except Exception as e:
-                logger.debug("Inflect fail token=%s grams=%s: %s", val, target_grammemes, e)
+
+            inflection = find_form(val, morpho[idx], inflector).inflect(target_grammemes)
+            if inflection is None:
                 inflected_tokens.append(val)
+            else:
+                inflected_tokens.append(inflection.word)
         else:
             inflected_tokens.append(val)
-    if not inflected_tokens:
+    if len(inflected_tokens) == 0:
         return ''
-    if inflected_tokens[0] and inflected_tokens[0][0].islower():
+    if inflected_tokens[0][0].islower():
         inflected_tokens[0] = inflected_tokens[0][0].upper() + inflected_tokens[0][1:]
-    res = ' '.join(inflected_tokens)
-    logger.debug("Inflected: %s -> %s", shorten(' '.join(phrase_tokens)), shorten(res))
-    return res
+    return ' '.join(inflected_tokens)
 
 
-@log_io()
-def replace_abbreviations(
-        old_text: str,
-        abbreviation_config: Dict[str, Tuple[List[str], List[Tuple[str, str, str]]]],
-        nlp: spacy.Language,
-        morph: MorphAnalyzer
-) -> str:
+def replace_abbreviations(old_text: str, abbreviation_config: Dict[str, Tuple[List[str], List[Tuple[str, str, str]]]],
+                          nlp: spacy.Language, morph: MorphAnalyzer) -> str:
     tokens, bounds, morpho_data = tokenize_and_analyze_morphology(old_text, nlp)
     new_text = copy.copy(old_text)
-    replaced = 0
     for idx, (token, (pos, case, number)) in enumerate(zip(tokens, morpho_data)):
-        key = token.lower()
-        if key in abbreviation_config:
+        if token.lower() in abbreviation_config:
             case = case if case in CASE_DICT.values() else ''
             number = number if number in NUMBER_DICT.values() else ''
             new_token = inflect_phrase(
-                abbreviation_config[key][0],
-                abbreviation_config[key][1],
+                abbreviation_config[token.lower()][0],
+                abbreviation_config[token.lower()][1],
                 morph,
                 case,
                 number
             )
             new_text = new_text[:bounds[idx][0]] + new_token + new_text[bounds[idx][1]:]
-            delta = len(new_token) - len(token)
-            if delta != 0:
-                bounds[idx] = (bounds[idx][0], bounds[idx][1] + delta)
+            if len(new_token) != len(token):
+                bounds[idx] = (
+                    bounds[idx][0],
+                    bounds[idx][1] + len(new_token) - len(token)
+                )
                 for other_idx in range(idx + 1, len(bounds)):
-                    bounds[other_idx] = (bounds[other_idx][0] + delta, bounds[other_idx][1] + delta)
-            replaced += 1
-    logger.info("Abbreviation replacements done: %d", replaced)
+                    bounds[other_idx] = (
+                        bounds[other_idx][0] + len(new_token) - len(token),
+                        bounds[other_idx][1] + len(new_token) - len(token)
+                    )
     return new_text
 
 
 def convert(text: str) -> str:
-    t0 = time_now()
-    logger.debug("convert: in_len=%d", len(text))
-    new_text = replace_abbreviations(text, config, spacy_nlp, pymorphy_an)
-    logger.debug("convert: out_len=%d elapsed=%s", len(new_text), elapsed(t0))
-    return new_text
+    return replace_abbreviations(text, config, spacy, pymorphy)
 
 
-@log_io()
 async def llm_model_func(
         prompt, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs
 ) -> str:
@@ -361,35 +282,31 @@ async def llm_model_func(
     )
 
 
-@log_io()
 async def gte_hf_embed(texts: List[str], tokenizer, embed_model) -> np.ndarray:
     device = next(embed_model.parameters()).device
-    logger.debug("Embed batch: size=%d device=%s", len(texts), device)
+    encoded_texts = tokenizer(
+        texts, return_tensors='pt', padding=True, truncation=True
+    ).to(device)
     batch_dict = tokenizer(
         texts, return_tensors='pt',
         max_length=LOCAL_EMBEDDER_MAX_TOKENS, padding=True, truncation=True,
     ).to(device)
     with torch.no_grad():
         outputs = embed_model(**batch_dict)
-        cls = outputs.last_hidden_state[:, 0, :]  # [B, H]
-        if cls.shape[1] > LOCAL_EMBEDDER_DIMENSION:
-            cls = cls[:, :LOCAL_EMBEDDER_DIMENSION]
-        embeddings = F.normalize(cls, p=2, dim=1)
+        embeddings = F.normalize(
+            outputs.last_hidden_state[:, 0][:LOCAL_EMBEDDER_DIMENSION],
+            p=2, dim=1
+        )
     if embeddings.dtype == torch.bfloat16:
-        arr = embeddings.detach().to(torch.float32).cpu().numpy()
+        return embeddings.detach().to(torch.float32).cpu().numpy()
     else:
-        arr = embeddings.detach().cpu().numpy()
-    logger.debug("Embed out: shape=%s dtype=%s", arr.shape, arr.dtype)
-    debug_mem("after-embed")
-    return arr
+        return embeddings.detach().cpu().numpy()
 
 
-@log_io()
 def explain_abbreviations_with_llm(document: str, abbreviations: dict) -> str:
     snow_stemmer = SnowballStemmer(language='russian')
     filtered_abbreviations = dict()
-    tokens = nltk.wordpunct_tokenize(document)
-    for cur_word in tokens:
+    for cur_word in nltk.wordpunct_tokenize(document):
         if cur_word in abbreviations:
             filtered_abbreviations[cur_word] = abbreviations[cur_word]
         elif cur_word.lower() in abbreviations:
@@ -406,7 +323,6 @@ def explain_abbreviations_with_llm(document: str, abbreviations: dict) -> str:
                 filtered_abbreviations[cur_word] = abbreviations[stem.upper()]
     del snow_stemmer
     if len(filtered_abbreviations) == 0:
-        logger.info("No abbreviations detected by stemmer — skipping LLM rewrite")
         return document
     user_prompt = TEMPLATE_FOR_ABBREVIATION_EXPLAINING.format(
         abbreviations_dict=filtered_abbreviations,
@@ -416,7 +332,6 @@ def explain_abbreviations_with_llm(document: str, abbreviations: dict) -> str:
     messages = [{'role': 'user', 'content': user_prompt}]
     global client
     try:
-        logger.debug("LLM call: model=%s prompt_len=%d", LLM_NAME, len(user_prompt))
         response = client.chat.completions.create(
             model=LLM_NAME,
             messages=messages,
@@ -425,23 +340,26 @@ def explain_abbreviations_with_llm(document: str, abbreviations: dict) -> str:
             max_tokens=QUERY_MAX_TOKENS
         )
         new_improved_document = response.choices[0].message.content
-        logger.info("LLM response received: len=%d", len(new_improved_document) if new_improved_document else -1)
         del response
-    except Exception as e:
-        logger.error("LLM call failed, fallback to original text: %s", e)
+    except:
         new_improved_document = document
+    del messages, user_prompt
     return new_improved_document
 
 
-@log_io()
 async def initialize_rag():
-    with log_section("Load local embedding tokenizer/model"):
-        emb_tokenizer = AutoTokenizer.from_pretrained(LOCAL_EMBEDDER_NAME)
-        emb_model = AutoModel.from_pretrained(LOCAL_EMBEDDER_NAME, trust_remote_code=True)
+    logger.info("Инициализация эмбеддера и RAG...")
+    with log_step("Загрузка локального эмбеддера"):
+        emb_tokenizer = AutoTokenizer.from_pretrained(
+            LOCAL_EMBEDDER_NAME
+        )
+        emb_model = AutoModel.from_pretrained(
+            LOCAL_EMBEDDER_NAME,
+            trust_remote_code=True
+        )
         emb_model.eval()
-    device_info()
+    with log_step("Создание LightRAG"):
 
-    with log_section("Initialize LightRAG"):
         rag = LightRAG(
             working_dir=WORKING_DIR,
             llm_model_func=llm_model_func,
@@ -458,22 +376,73 @@ async def initialize_rag():
             addon_params={'language': 'Russian'},
         )
 
-    with log_section("Initialize storages & pipeline status"):
+    with log_step("Инициализация хранилищ RAG"):
         await rag.initialize_storages()
         await initialize_pipeline_status()
-
+    logger.info("LightRAG готов.")
     return rag
 
 
 if __name__ == '__main__':
     setup_logger("lightrag", level="INFO")
     random.seed(RANDOM_SEED)
-    debug_mem("start")
+    logger.info("Скрипт запущен. RANDOM_SEED=%s", RANDOM_SEED)
 
     dataset_dir = 'pages_txt'
+    print(f'os.path.isdir({dataset_dir}) = {os.path.isdir(dataset_dir)}')
+
+    text_files = list(
+        map(lambda it2: os.path.join(dataset_dir, it2),
+            filter(lambda it1: it1.endswith('.txt'), os.listdir(dataset_dir))))
+
+    # python -m spacy download ru_core_news_sm
+    config_fname = os.path.join('full_abbreviations_updated.json')
+    config, spacy, pymorphy = initialize_abbreviation_subsystem(config_fname)
+
+    text_data = []
+    for cur_fname in text_files:
+        with codecs.open(cur_fname, mode='r', encoding='utf-8', errors='ignore') as fp:
+            new_text = '\n'.join(list(map(
+                lambda it3: ' '.join(it3.replace('\r', ' ').split()),
+                filter(
+                    lambda it2: len(it2) > 0,
+                    map(
+                        lambda it1: it1.strip(),
+                        fp.readlines()
+                    )
+                )
+            ))).strip()
+        if len(new_text) > 0:
+            text_data.append(convert(new_text))
+        del new_text
+
+    print(f'Number of documents is {len(text_data)}.')
+    print(f'3 random documents:')
+    for it in random.sample(text_data, 3):
+        print('\n' + it)
+
+    special_tokens = dict()
+    re_for_special_tokens = re.compile(r'\[\w+?\]')
+    for cur_text in tqdm(text_data):
+        start_pos = 0
+        search_res = re_for_special_tokens.search(cur_text[start_pos:])
+        while search_res is not None:
+            token_start = start_pos + search_res.start()
+            token_end = start_pos + search_res.end()
+            new_special_token = cur_text[token_start:token_end]
+            special_tokens[new_special_token] = special_tokens.get(new_special_token, 0) + 1
+            start_pos = token_end
+            search_res = re_for_special_tokens.search(cur_text[start_pos:])
+    special_token_keys = sorted(list(special_tokens.keys()), key=lambda it: (-special_tokens[it], it))
+    print(f'There are {len(special_tokens)} special tokens. They are:')
+    for it in special_token_keys:
+        print('{0:>20}: {1:>6}'.format(it, special_tokens[it]))
+
     WORKING_DIR = 'prepared_it_new'
-    VLLM_API_KEY = os.getenv("VLLM_API_KEY", "")
-    VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "everest.nsu.ru:9111")
+    if not os.path.exists(WORKING_DIR):
+        os.mkdir(WORKING_DIR)
+    VLLM_API_KEY = ''
+    VLLM_BASE_URL = 'everest.nsu.ru:9111'
     os.environ['OPENAI_API_KEY'] = VLLM_API_KEY
     LLM_NAME = 'RuadaptQwen3-32B-Instruct'
     TEMPERATURE = 0.3
@@ -481,8 +450,9 @@ if __name__ == '__main__':
     LOCAL_EMBEDDER_DIMENSION = 768
     LOCAL_EMBEDDER_MAX_TOKENS = 4096
     LOCAL_EMBEDDER_NAME = '/workspace/data/models/gte-multilingual-base'
+    print(f'os.path.isdir({LOCAL_EMBEDDER_NAME}) = {os.path.isdir(LOCAL_EMBEDDER_NAME)}')
     ABBREVIATIONS_FNAME = 'full_abbreviations_updated.json'
-    MAX_NUMBER_OF_TEXTS = None
+    print(f'os.path.isfile({ABBREVIATIONS_FNAME}) = {os.path.isfile(ABBREVIATIONS_FNAME)}')
     TEMPLATE_FOR_ABBREVIATION_EXPLAINING = '''Отредактируйте, пожалуйста, текст заданного документа так, чтобы этот документ стал более простым и понятным для обычных людей от юных старшеклассников до пожилых мужчин и женщин. При этом не надо, пожалуйста, применять markdown или иной вид гипертекста. Главное, на что вам надо обратить внимание и по возможности исправить - это логика изложения и понятность формулировок документа. Ничего не объясняйте и не комментируйте своё решение, просто перепишите текст документа.
 
     Обратите внимание, что документ анонимизирован, то есть все именованные сущности заменены специальными словами-масками в квадратных скобках (например, вместо текста "Иван Иванович Иванов любит горчицу" вы встретите текст "[NAME] любит горчицу"). Полный список специальных слов-масок приведён здесь: {special_masks}. Не изменяйте этих слов, пожалуйста, а оставляйте как есть.
@@ -498,158 +468,52 @@ if __name__ == '__main__':
     ```text
     {text_of_document}
     ```'''
+    logger.info("WORKING_DIR=%s", WORKING_DIR)
+    logger.info("DATASET_DIR=%s (exists=%s)", dataset_dir, os.path.isdir(dataset_dir))
+    logger.info("EMBEDDER_PATH=%s (exists=%s)", LOCAL_EMBEDDER_NAME, os.path.isdir(LOCAL_EMBEDDER_NAME))
+    logger.info("ABBR_JSON=%s (exists=%s)", ABBREVIATIONS_FNAME, os.path.isfile(ABBREVIATIONS_FNAME))
+    logger.info("LLM: model=%s, base_url=%s, temp=%.2f, max_tokens=%d", LLM_NAME, VLLM_BASE_URL, TEMPERATURE, QUERY_MAX_TOKENS)
 
-    logger.info("ENV " + log_kv(
-        dataset_dir=dataset_dir,
-        WORKING_DIR=WORKING_DIR,
-        LLM_NAME=LLM_NAME,
-        LOCAL_EMBEDDER_NAME=LOCAL_EMBEDDER_NAME,
-        LOCAL_EMBEDDER_DIMENSION=LOCAL_EMBEDDER_DIMENSION,
-        LOCAL_EMBEDDER_MAX_TOKENS=LOCAL_EMBEDDER_MAX_TOKENS,
-        VLLM_BASE_URL=VLLM_BASE_URL,
-        KEY_SET=bool(VLLM_API_KEY)
-    ))
+    client = OpenAI(
+        api_key=VLLM_API_KEY,
+        base_url=VLLM_BASE_URL,
+    )
 
-    with log_section("Sanity checks"):
-        logger.info("Check dataset dir exists: %s -> %s", dataset_dir, os.path.isdir(dataset_dir))
-        logger.info("Check local embedder dir exists: %s -> %s", LOCAL_EMBEDDER_NAME,
-                    os.path.isdir(LOCAL_EMBEDDER_NAME))
-        logger.info("Check abbreviations file exists: %s -> %s", ABBREVIATIONS_FNAME,
-                    os.path.isfile(ABBREVIATIONS_FNAME))
-
-    with log_section("Collect .txt files"):
-        if not os.path.isdir(dataset_dir):
-            logger.error("Dataset dir does not exist: %s", dataset_dir)
-        text_files = [
-            os.path.join(dataset_dir, fname)
-            for fname in os.listdir(dataset_dir) if fname.endswith(".txt")
-        ]
-        logger.info("Text files found: %d", len(text_files))
-        logger.debug("Sample files: %s", shorten(text_files[:5], 500))
-
-    config_fname = os.path.join(ABBREVIATIONS_FNAME)
-    with log_section("Initialize abbreviation subsystem"):
-        config, spacy_nlp, pymorphy_an = initialize_abbreviation_subsystem(config_fname)
-
-    text_data: List[str] = []
-    with log_section("Read & normalize text files"):
-        for cur_fname in tqdm(text_files, desc="read_files"):
-            try:
-                with codecs.open(cur_fname, mode='r', encoding='utf-8', errors='ignore') as fp:
-                    lines = fp.readlines()
-                new_text = '\n'.join(
-                    ' '.join(line.replace('\r', ' ').split())
-                    for line in (ln.strip() for ln in lines)
-                    if len(line) > 0
-                ).strip()
-                if new_text:
-                    text_data.append(convert(new_text))
-            except Exception as e:
-                logger.error("Failed to read/process file %s: %s", cur_fname, e)
-    logger.info("Number of documents: %d", len(text_data))
-
-    if text_data:
-        try:
-            logger.info("3 random documents preview:")
-            for it in random.sample(text_data, min(3, len(text_data))):
-                logger.debug("DOC:\n%s\n", shorten(it, 2000))
-        except Exception:
-            pass
-
-    with log_section("Scan special tokens like [MASK]"):
-        special_tokens: Dict[str, int] = dict()
-        re_for_special_tokens = re.compile(r'\[\w+?\]')
-        for cur_text in tqdm(text_data, desc="scan_special_tokens"):
-            start_pos = 0
-            search_res = re_for_special_tokens.search(cur_text[start_pos:])
-            while search_res is not None:
-                token_start = start_pos + search_res.start()
-                token_end = start_pos + search_res.end()
-                new_special_token = cur_text[token_start:token_end]
-                special_tokens[new_special_token] = special_tokens.get(new_special_token, 0) + 1
-                start_pos = token_end
-                search_res = re_for_special_tokens.search(cur_text[start_pos:])
-        special_token_keys = sorted(list(special_tokens.keys()), key=lambda it: (-special_tokens[it], it))
-        logger.info("Special tokens: unique=%d total=%d",
-                    len(special_tokens), sum(special_tokens.values()))
-        for it in special_token_keys[:50]:
-            logger.debug("%20s : %6d", it, special_tokens[it])
-
-    with log_section("Prepare working dir"):
-        if not os.path.exists(WORKING_DIR):
-            os.mkdir(WORKING_DIR)
-            logger.info("Created dir: %s", WORKING_DIR)
-        else:
-            logger.info("Dir exists: %s", WORKING_DIR)
-
-    with log_section("Init OpenAI client"):
-        try:
-            client = OpenAI(api_key=VLLM_API_KEY, base_url=VLLM_BASE_URL)
-            logger.info("OpenAI client initialized (base_url=%s, key_set=%s)",
-                        VLLM_BASE_URL, bool(VLLM_API_KEY))
-        except Exception as e:
-            logger.error("Failed to init OpenAI client: %s", e)
-            client = None
+    MAX_NUMBER_OF_TEXTS = None
 
     improved_texts_fname = os.path.join(WORKING_DIR, 'improved_texts.json')
-    improved_texts: List[str] = []
 
-    with log_section("Load or build improved_texts"):
-        if os.path.isfile(improved_texts_fname):
-            logger.info("Found existing improved_texts: %s", improved_texts_fname)
-            try:
-                with open(improved_texts_fname, mode='r', encoding='utf-8') as fp:
-                    improved_texts = json.load(fp)
-                logger.info("Loaded improved_texts: %d items", len(improved_texts))
-            except Exception as e:
-                logger.error("Failed to read existing improved_texts, will rebuild: %s", e)
+    if os.path.isfile(improved_texts_fname):
+        with open(improved_texts_fname, mode='r', encoding='utf-8') as fp:
+            improved_texts = json.load(fp)
+        logger.info("Загружено improved_texts: %d", len(improved_texts))
 
-        if not improved_texts:
-            logger.warning("No improved_texts present — fallback to original text_data (no LLM rewrite).")
-            improved_texts = list(text_data)
+    with codecs.open(improved_texts_fname, mode='w', encoding='utf-8') as fp:
+        json.dump(fp=fp, obj=improved_texts, ensure_ascii=False, indent=4)
+        logger.info("Сохранено improved_texts.json (%d)", len(improved_texts))
 
-        try:
-            with codecs.open(improved_texts_fname, mode='w', encoding='utf-8') as fp:
-                json.dump(improved_texts, fp, ensure_ascii=False, indent=2)  # FIX: порядок аргументов
-            logger.info("Saved improved_texts to %s (count=%d)", improved_texts_fname, len(improved_texts))
-        except Exception as e:
-            logger.error("Failed to save improved_texts: %s", e)
-
-    with log_section("Show 3 examples of improved_texts"):
-        if improved_texts:
-            if MAX_NUMBER_OF_TEXTS is None:
-                pool = list(range(len(text_data)))
-            else:
-                pool = list(range(min(len(text_data), MAX_NUMBER_OF_TEXTS)))
-            if pool:
-                selected_indices = random.sample(pool, min(3, len(pool)))
-                for idx in selected_indices:
-                    logger.debug("BEFORE:\n%s", shorten(' '.join(text_data[idx].split()), 2000))
-                    logger.debug("AFTER:\n%s", shorten(' '.join(improved_texts[idx].split()), 2000))
-        else:
-            logger.warning("improved_texts is empty — nothing to preview")
+    # print(f'3 random examples of improved texts:')
+    # if MAX_NUMBER_OF_TEXTS is None:
+    #     selected_indices = random.sample(list(range(len(text_data))), 3)
+    # else:
+    #     selected_indices = random.sample(list(range(len(text_data[0:MAX_NUMBER_OF_TEXTS]))), 3)
+    # for example_index in selected_indices:
+    #     print('')
+    #     print('BEFORE IMPROVING:')
+    #     print(' '.join(text_data[example_index].split()))
+    #     print('AFTER IMPROVING:')
+    #     print(' '.join(improved_texts[example_index].split()))
 
     nest_asyncio.apply()
-    with log_section("Initialize RAG (async)"):
-        try:
-            rag = asyncio.run(initialize_rag())
-        except Exception as e:
-            logger.error("RAG init failed: %s", e)
-            raise
-
-    with log_section("Insert documents into RAG"):
-        to_iter = improved_texts if MAX_NUMBER_OF_TEXTS is None else improved_texts[:MAX_NUMBER_OF_TEXTS]
-        for cur_text in tqdm(to_iter, desc="rag_insert"):
-            try:
+    with log_step("Инициализация RAG (async)"):
+        rag = asyncio.run(initialize_rag())
+    with log_step("Вставка документов в хранилища RAG"):
+        if MAX_NUMBER_OF_TEXTS is None:
+            for cur_text in tqdm(improved_texts):
                 rag.insert(cur_text)
-            except Exception as e:
-                logger.error("Failed to insert doc into RAG: %s", e)
-
-    with log_section("Finalize storages"):
-        try:
-            rag.finalize_storages()
-        except Exception as e:
-            logger.error("Finalize storages failed: %s", e)
-
-    logger.info("Pipeline complete.")
-    debug_mem("end")
+        else:
+            for cur_text in tqdm(improved_texts[0:MAX_NUMBER_OF_TEXTS]):
+                rag.insert(cur_text)
+    with log_step("Финализация RAG-хранилищ"):
+        rag.finalize_storages()
+    logger.info("Пайплайн завершён успешно.")
