@@ -2,10 +2,14 @@ import asyncio
 import codecs
 import copy
 import json
+import logging
 import os
 import random
 import re
+import time
 import warnings
+from contextlib import contextmanager
+from typing import Any
 from typing import Dict, List, Tuple
 
 import nest_asyncio
@@ -23,12 +27,7 @@ from openai import OpenAI
 from pymorphy3 import MorphAnalyzer
 from pymorphy3.analyzer import Parse
 from tqdm.auto import tqdm
-from tqdm.contrib.logging import logging_redirect_tqdm
 from transformers import AutoTokenizer, AutoModel
-import logging
-import time
-from contextlib import contextmanager
-from typing import Any, Optional
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
 
@@ -38,12 +37,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("kg_pipeline")
 
+
 def secs(dt: float) -> str:
     return f"{dt:.3f}s"
+
 
 def shorten(obj: Any, limit: int = 500) -> str:
     s = str(obj)
     return s if len(s) <= limit else s[:limit] + f"...(+{len(s) - limit} chars)"
+
 
 @contextmanager
 def log_step(title: str, level: int = logging.INFO):
@@ -56,6 +58,7 @@ def log_step(title: str, level: int = logging.INFO):
         raise
     finally:
         logger.log(level, f"✔ {title} — done in {secs(time.time() - t0)}")
+
 
 RANDOM_SEED = 42
 
@@ -359,7 +362,6 @@ async def initialize_rag():
         )
         emb_model.eval()
     with log_step("Создание LightRAG"):
-
         rag = LightRAG(
             working_dir=WORKING_DIR,
             llm_model_func=llm_model_func,
@@ -394,7 +396,6 @@ if __name__ == '__main__':
     text_files = list(
         map(lambda it2: os.path.join(dataset_dir, it2),
             filter(lambda it1: it1.endswith('.txt'), os.listdir(dataset_dir))))
-
     # python -m spacy download ru_core_news_sm
     config_fname = os.path.join('full_abbreviations_updated.json')
     config, spacy, pymorphy = initialize_abbreviation_subsystem(config_fname)
@@ -416,7 +417,7 @@ if __name__ == '__main__':
             text_data.append(convert(new_text))
         del new_text
 
-    print(f'Number of documents is {len(text_data)}.')
+    logger.info("Загружено из %s: %d txt-файлов", dataset_dir, len(text_data))
     print(f'3 random documents:')
     for it in random.sample(text_data, 3):
         print('\n' + it)
@@ -450,9 +451,9 @@ if __name__ == '__main__':
     LOCAL_EMBEDDER_DIMENSION = 768
     LOCAL_EMBEDDER_MAX_TOKENS = 4096
     LOCAL_EMBEDDER_NAME = '/workspace/data/models/gte-multilingual-base'
-    print(f'os.path.isdir({LOCAL_EMBEDDER_NAME}) = {os.path.isdir(LOCAL_EMBEDDER_NAME)}')
+    logger.info(f'os.path.isdir({LOCAL_EMBEDDER_NAME}) = {os.path.isdir(LOCAL_EMBEDDER_NAME)}')
     ABBREVIATIONS_FNAME = 'full_abbreviations_updated.json'
-    print(f'os.path.isfile({ABBREVIATIONS_FNAME}) = {os.path.isfile(ABBREVIATIONS_FNAME)}')
+    logger.info(f'os.path.isfile({ABBREVIATIONS_FNAME}) = {os.path.isfile(ABBREVIATIONS_FNAME)}')
     TEMPLATE_FOR_ABBREVIATION_EXPLAINING = '''Отредактируйте, пожалуйста, текст заданного документа так, чтобы этот документ стал более простым и понятным для обычных людей от юных старшеклассников до пожилых мужчин и женщин. При этом не надо, пожалуйста, применять markdown или иной вид гипертекста. Главное, на что вам надо обратить внимание и по возможности исправить - это логика изложения и понятность формулировок документа. Ничего не объясняйте и не комментируйте своё решение, просто перепишите текст документа.
 
     Обратите внимание, что документ анонимизирован, то есть все именованные сущности заменены специальными словами-масками в квадратных скобках (например, вместо текста "Иван Иванович Иванов любит горчицу" вы встретите текст "[NAME] любит горчицу"). Полный список специальных слов-масок приведён здесь: {special_masks}. Не изменяйте этих слов, пожалуйста, а оставляйте как есть.
@@ -472,7 +473,8 @@ if __name__ == '__main__':
     logger.info("DATASET_DIR=%s (exists=%s)", dataset_dir, os.path.isdir(dataset_dir))
     logger.info("EMBEDDER_PATH=%s (exists=%s)", LOCAL_EMBEDDER_NAME, os.path.isdir(LOCAL_EMBEDDER_NAME))
     logger.info("ABBR_JSON=%s (exists=%s)", ABBREVIATIONS_FNAME, os.path.isfile(ABBREVIATIONS_FNAME))
-    logger.info("LLM: model=%s, base_url=%s, temp=%.2f, max_tokens=%d", LLM_NAME, VLLM_BASE_URL, TEMPERATURE, QUERY_MAX_TOKENS)
+    logger.info("LLM: model=%s, base_url=%s, temp=%.2f, max_tokens=%d", LLM_NAME, VLLM_BASE_URL, TEMPERATURE,
+                QUERY_MAX_TOKENS)
 
     client = OpenAI(
         api_key=VLLM_API_KEY,
@@ -487,6 +489,10 @@ if __name__ == '__main__':
         with open(improved_texts_fname, mode='r', encoding='utf-8') as fp:
             improved_texts = json.load(fp)
         logger.info("Загружено improved_texts: %d", len(improved_texts))
+
+    data_iter = text_data if MAX_NUMBER_OF_TEXTS is None else text_data[:MAX_NUMBER_OF_TEXTS]
+    for cur_text in tqdm(data_iter):
+        improved_texts.append(cur_text)
 
     with codecs.open(improved_texts_fname, mode='w', encoding='utf-8') as fp:
         json.dump(fp=fp, obj=improved_texts, ensure_ascii=False, indent=4)
